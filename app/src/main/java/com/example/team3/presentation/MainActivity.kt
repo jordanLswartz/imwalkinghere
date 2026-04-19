@@ -6,6 +6,8 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -46,7 +48,9 @@ import com.example.team3.presentation.theme.Team3Theme
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.HttpURLConnection
 import java.net.InetAddress
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -106,12 +110,14 @@ private data class SensorSample(
 
 private class UdpCsvStreamer {
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var socket: DatagramSocket? = null
 
     fun send(
         host: String,
         port: Int,
         line: String,
+        onResult: (String) -> Unit,
     ) {
         executor.execute {
             try {
@@ -128,8 +134,11 @@ private class UdpCsvStreamer {
                         port,
                     )
                 activeSocket.send(packet)
+                mainHandler.post { onResult("UDP OK ${host.trim()}:$port") }
             } catch (error: Exception) {
                 Log.e("Team3", "UDP send failed", error)
+                val message = error.message ?: error::class.java.simpleName
+                mainHandler.post { onResult("UDP failed: $message") }
             }
         }
     }
@@ -141,18 +150,74 @@ private class UdpCsvStreamer {
     }
 }
 
-private const val SAMPLE_PERIOD_US = 100_000
-private const val RECORDING_DURATION_NS = 30_000_000_000L
+private class CsvFileSender {
+    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun sendLatestFile(
+        context: Context,
+        host: String,
+        port: Int,
+        onResult: (String) -> Unit,
+    ) {
+        executor.execute {
+            val latestFile = latestCsvFile(context)
+            if (latestFile == null) {
+                mainHandler.post { onResult("No CSV found") }
+                return@execute
+            }
+
+            try {
+                val connection =
+                    (URL("http://$host:$port/upload").openConnection() as HttpURLConnection).apply {
+                        requestMethod = "POST"
+                        connectTimeout = 10_000
+                        readTimeout = 10_000
+                        doOutput = true
+                        setRequestProperty("Content-Type", "text/csv")
+                        setRequestProperty("X-Filename", latestFile.name)
+                    }
+
+                connection.outputStream.use { output ->
+                    latestFile.inputStream().use { input ->
+                        input.copyTo(output)
+                    }
+                }
+
+                val responseCode = connection.responseCode
+                if (responseCode in 200..299) {
+                    mainHandler.post { onResult("Sent ${latestFile.name}") }
+                } else {
+                    mainHandler.post { onResult("Send failed: HTTP $responseCode") }
+                }
+                connection.disconnect()
+            } catch (error: Exception) {
+                Log.e("Team3", "CSV send failed", error)
+                mainHandler.post { onResult("Send failed") }
+            }
+        }
+    }
+
+    fun close() {
+        executor.shutdownNow()
+    }
+}
+
+private const val SAMPLE_PERIOD_US = 40_000
+private const val RECORDING_DURATION_NS = 60_000_000_000L
 private const val RECORDING_PENDING_START_NS = -1L
+private const val DISPLAY_SAMPLE_RATE_HZ = 1_000_000 / SAMPLE_PERIOD_US
 
 @Composable
 private fun SensorApp() {
     val context = LocalContext.current
     val scrollState = rememberScrollState()
     val streamer = remember { UdpCsvStreamer() }
+    val fileSender = remember { CsvFileSender() }
     DisposableEffect(Unit) {
         onDispose {
             streamer.close()
+            fileSender.close()
         }
     }
 
@@ -165,8 +230,11 @@ private fun SensorApp() {
 
     var streamHost by rememberSaveable { mutableStateOf("") }
     var streamPortText by rememberSaveable { mutableStateOf("8989") }
+    var filePortText by rememberSaveable { mutableStateOf("8990") }
     var isStreaming by rememberSaveable { mutableStateOf(false) }
     var streamStatus by rememberSaveable { mutableStateOf("Streaming off") }
+    var fileSendStatus by rememberSaveable { mutableStateOf("File send idle") }
+    var isSendingFile by rememberSaveable { mutableStateOf(false) }
 
     val gyroReading = rememberGyroscopeReading(isSampling = isSampling)
 
@@ -199,6 +267,9 @@ private fun SensorApp() {
                             host = streamHost.trim(),
                             port = port,
                             line = sample.toCsvLine(),
+                            onResult = { result ->
+                                streamStatus = result
+                            },
                         )
                     }
                 }
@@ -256,7 +327,7 @@ private fun SensorApp() {
                         when {
                             !isSampling -> "Paused"
                             !accelerometerReading.hasReading -> "Waiting for sensor data..."
-                            else -> "Streaming at 10 Hz"
+                            else -> "Streaming at ${DISPLAY_SAMPLE_RATE_HZ} Hz"
                         },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.primary,
@@ -313,6 +384,14 @@ private fun SensorApp() {
                     },
                     keyboardType = KeyboardType.Number,
                 )
+                LabeledInput(
+                    label = "File port",
+                    value = filePortText,
+                    onValueChange = { newValue ->
+                        filePortText = newValue.filter { it.isDigit() }
+                    },
+                    keyboardType = KeyboardType.Number,
+                )
                 Text(
                     text = streamStatus,
                     style = MaterialTheme.typography.bodySmall,
@@ -338,6 +417,38 @@ private fun SensorApp() {
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(if (isStreaming) "Stop UDP Stream" else "Start UDP Stream")
+                }
+
+                Text(
+                    text = fileSendStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 8.dp, bottom = 8.dp),
+                )
+
+                Button(
+                    onClick = {
+                        val port = filePortText.toIntOrNull()
+                        if (streamHost.isBlank() || port == null) {
+                            fileSendStatus = "Set Mac IP and file port"
+                        } else {
+                            isSendingFile = true
+                            fileSendStatus = "Sending latest CSV..."
+                            fileSender.sendLatestFile(
+                                context = context,
+                                host = streamHost.trim(),
+                                port = port,
+                                onResult = { result ->
+                                    isSendingFile = false
+                                    fileSendStatus = result
+                                },
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isSendingFile,
+                ) {
+                    Text(if (isSendingFile) "Sending..." else "Send Latest CSV")
                 }
 
                 Text(
@@ -384,7 +495,7 @@ private fun SensorApp() {
                             .padding(top = 8.dp),
                     enabled = recordingStartNs == null,
                 ) {
-                    Text("Record 30s CSV")
+                    Text("Record 60s CSV")
                 }
             }
         }
@@ -606,6 +717,14 @@ private fun writeCsv(
         }
     outputFile.writeText(csvContent)
     return outputFile
+}
+
+private fun latestCsvFile(context: Context): File? {
+    val outputDir = context.getExternalFilesDir(null) ?: context.filesDir
+    return outputDir
+        .listFiles()
+        ?.filter { it.isFile && it.extension.equals("csv", ignoreCase = true) }
+        ?.maxByOrNull { it.name }
 }
 
 private fun csvHeader(): String =
